@@ -63,6 +63,7 @@ class Status < ApplicationRecord
   has_many :mentions, dependent: :destroy, inverse_of: :status
   has_many :active_mentions, -> { active }, class_name: 'Mention', inverse_of: :status
   has_many :media_attachments, dependent: :nullify
+  has_many :capability_tokens, class_name: 'StatusCapabilityToken', inverse_of: :status, dependent: :destroy
 
   has_and_belongs_to_many :tags
   has_and_belongs_to_many :preview_cards
@@ -205,7 +206,9 @@ class Status < ApplicationRecord
     public_visibility? || unlisted_visibility?
   end
 
-  alias sign? distributable?
+  def sign?
+    distributable? || limited_visibility?
+  end
 
   def with_media?
     media_attachments.any?
@@ -464,7 +467,7 @@ class Status < ApplicationRecord
       self.in_reply_to_account_id = carried_over_reply_to_account_id
       self.conversation_id        = thread.conversation_id if conversation_id.nil?
     elsif conversation_id.nil?
-      self.conversation = Conversation.new
+      self.conversation = Conversation.new(parent_status: self, parent_account: account)
     end
   end
 

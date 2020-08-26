@@ -43,7 +43,7 @@ class ActivityPub::Activity::Create < ActivityPub::Activity
   end
 
   def create_status
-    return reject_payload! if unsupported_object_type? || invalid_origin?(@object['id']) || Tombstone.exists?(uri: @object['id']) || !related_to_local_activity?
+    return reject_payload! if unsupported_object_type? || invalid_origin?(object_uri) || tombstone_exists? || !related_to_local_activity?
 
     RedisLock.acquire(lock_options) do |lock|
       if lock.acquired?
@@ -90,7 +90,8 @@ class ActivityPub::Activity::Create < ActivityPub::Activity
     fetch_replies(@status)
     check_for_spam
     distribute(@status)
-    forward_for_reply if @status.distributable?
+    forward_for_conversation
+    forward_for_reply
   end
 
   def find_existing_status
@@ -102,8 +103,8 @@ class ActivityPub::Activity::Create < ActivityPub::Activity
   def process_status_params
     @params = begin
       {
-        uri: @object['id'],
-        url: object_url || @object['id'],
+        uri: object_uri,
+        url: object_url || object_uri,
         account: @account,
         text: text_from_content || '',
         language: detected_language,
@@ -114,7 +115,7 @@ class ActivityPub::Activity::Create < ActivityPub::Activity
         sensitive: @object['sensitive'] || false,
         visibility: visibility_from_audience,
         thread: replied_to_status,
-        conversation: conversation_from_uri(@object['conversation']),
+        conversation: conversation_from_context,
         media_attachment_ids: process_attachments.take(4).map(&:id),
         poll: process_poll,
       }
@@ -122,8 +123,10 @@ class ActivityPub::Activity::Create < ActivityPub::Activity
   end
 
   def process_audience
+    conversation_uri = value_or_id(@object['context'])
+
     (audience_to + audience_cc).uniq.each do |audience|
-      next if audience == ActivityPub::TagManager::COLLECTIONS[:public]
+      next if audience == ActivityPub::TagManager::COLLECTIONS[:public] || audience == conversation_uri
 
       # Unlike with tags, there is no point in resolving accounts we don't already
       # know here, because silent mentions would only be used for local access
@@ -340,15 +343,23 @@ class ActivityPub::Activity::Create < ActivityPub::Activity
     ActivityPub::FetchRepliesWorker.perform_async(status.id, uri) unless uri.nil?
   end
 
-  def conversation_from_uri(uri)
-    return nil if uri.nil?
-    return Conversation.find_by(id: OStatus::TagManager.instance.unique_tag_to_local_id(uri, 'Conversation')) if OStatus::TagManager.instance.local_id?(uri)
+  def conversation_from_context
+    return if @object['context'].nil?
 
-    begin
-      Conversation.find_or_create_by!(uri: uri)
-    rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotUnique
-      retry
+    uri          = value_or_id(@object['context'])
+    conversation = ActivityPub::TagManager.instance.uri_to_resource(uri, Conversation)
+
+    return conversation if conversation.present?
+
+    conversation_json = begin
+      if @object['context'].is_a?(Hash)
+        @object['context']
+      else
+        fetch_resource(uri)
+      end
     end
+
+    Conversation.create!(uri: uri, inbox_url: conversation_json['inbox'])
   end
 
   def visibility_from_audience
@@ -359,7 +370,7 @@ class ActivityPub::Activity::Create < ActivityPub::Activity
     elsif audience_to.include?(@account.followers_url)
       :private
     else
-      :direct
+      :limited
     end
   end
 
@@ -484,12 +495,22 @@ class ActivityPub::Activity::Create < ActivityPub::Activity
     Account.local.where(username: local_usernames).exists?
   end
 
+  def tombstone_exists?
+    Tombstone.exists?(uri: object_uri)
+  end
+
   def check_for_spam
     SpamCheck.perform(@status)
   end
 
+  def forward_for_conversation
+    return unless audience_to.include?(value_or_id(@object['context'])) && @json['signature'].present? && @status.conversation.local?
+
+    ActivityPub::ForwardDistributionWorker.perform_async(@status.conversation_id, Oj.dump(@json))
+  end
+
   def forward_for_reply
-    return unless @json['signature'].present? && reply_to_local?
+    return unless @status.distributable? && @json['signature'].present? && reply_to_local?
 
     ActivityPub::RawDistributionWorker.perform_async(Oj.dump(@json), replied_to_status.account_id, [@account.preferred_inbox_url])
   end
